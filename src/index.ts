@@ -6,6 +6,7 @@ import express, { type Request, type Response } from 'express';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
+import { registerCheckinRoutes, checkinToolDef, handleCheckinTool } from './checkin.js';
 
 interface ToolArguments {
 	days?: number;
@@ -146,6 +147,7 @@ function createMcpServer(): Server {
 				description: 'Get the Whoop authorization URL to connect your account.',
 				inputSchema: { type: 'object', properties: {}, required: [] },
 			},
+			checkinToolDef,
 		],
 	}));
 
@@ -321,6 +323,10 @@ function createMcpServer(): Server {
 					};
 				}
 
+				case 'get_checkins': {
+					return handleCheckinTool(typedArgs);
+				}
+
 				default:
 					throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
 			}
@@ -363,6 +369,8 @@ async function main(): Promise<void> {
 		app.get('/health', (_req: Request, res: Response) => {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
+
+		registerCheckinRoutes(app);
 
 		app.all('/mcp', async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;

@@ -381,8 +381,11 @@ async function main(): Promise<void> {
 				if (sessionId && transports.has(sessionId)) {
 					const session = transports.get(sessionId)!;
 					session.lastAccess = Date.now();
-					transport = session.transport;
-				} else {
+				transport = session.transport;
+			} else if (sessionId) {
+				res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+				return;
+			} else {
 					transport = new StreamableHTTPServerTransport({
 						sessionIdGenerator: () => crypto.randomUUID(),
 						onsessioninitialized: newSessionId => {

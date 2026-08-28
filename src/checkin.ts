@@ -1,1 +1,1 @@
-export * from './checkin_1.js';
+export * from './checkin_1_2.js';

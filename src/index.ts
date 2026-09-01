@@ -1,1 +1,1 @@
-import './index_1.js';
+import './index_v8.js';

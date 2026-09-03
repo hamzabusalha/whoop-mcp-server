@@ -1,0 +1,1378 @@
+import Database from 'better-sqlite3';
+import { timingSafeEqual } from 'node:crypto';
+import type { Express, Request, Response } from 'express';
+
+// ---------------------------------------------------------------------------
+// Hamza's daily check-in: a small survey page served by this server, storing
+// entries in the same SQLite database as the Whoop data. No sign-in — access
+// is a private key in the URL (CHECKIN_KEY env var). The morning brief reads
+// the log through the get_checkins MCP tool.
+// ---------------------------------------------------------------------------
+
+const CHECKIN_KEY = process.env.CHECKIN_KEY ?? '';
+const CHECKIN_DB_PATH = process.env.DB_PATH ?? './whoop.db';
+const MAX_ENTRY_BYTES = 16000;
+
+type CheckinEntry = Record<string, unknown> & { gym?: Record<string, unknown> };
+
+let checkinDb: Database.Database | null = null;
+
+function getDb(): Database.Database {
+	if (!checkinDb) {
+		checkinDb = new Database(CHECKIN_DB_PATH);
+		checkinDb.pragma('journal_mode = WAL');
+		checkinDb.exec(`
+			CREATE TABLE IF NOT EXISTS checkins (
+				date TEXT PRIMARY KEY,
+				data TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS brief (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				html TEXT NOT NULL,
+				label TEXT,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS briefs (
+				date TEXT PRIMARY KEY,
+				html TEXT NOT NULL,
+				label TEXT,
+				updated_at TEXT NOT NULL
+			);
+		`);
+		const briefCols = checkinDb.prepare('PRAGMA table_info(briefs)').all() as Array<{ name: string }>;
+		if (!briefCols.some(c => c.name === 'live')) {
+			checkinDb.exec('ALTER TABLE briefs ADD COLUMN live TEXT');
+		}
+		// one-time migration: seed the dated history from the old single-row brief
+		const seeded = checkinDb.prepare('SELECT COUNT(*) AS n FROM briefs').get() as { n: number };
+		if (seeded.n === 0) {
+			const legacy = checkinDb.prepare('SELECT html, label FROM brief WHERE id = 1').get() as
+				| { html: string; label: string | null }
+				| undefined;
+			if (legacy) {
+				checkinDb
+					.prepare('INSERT OR IGNORE INTO briefs (date, html, label, updated_at) VALUES (?, ?, ?, ?)')
+					.run(ammanToday(), legacy.html, legacy.label, new Date().toISOString());
+			}
+		}
+	}
+	return checkinDb;
+}
+
+function keyOk(req: Request): boolean {
+	const given = String(req.query.key ?? '');
+	if (!CHECKIN_KEY || !given) return false;
+	const a = Buffer.from(given);
+	const b = Buffer.from(CHECKIN_KEY);
+	return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function validDate(d: unknown): d is string {
+	return typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d);
+}
+
+function readEntries(days: number): Record<string, CheckinEntry> {
+	const rows = getDb()
+		.prepare('SELECT date, data FROM checkins ORDER BY date DESC LIMIT ?')
+		.all(days) as Array<{ date: string; data: string }>;
+	const entries: Record<string, CheckinEntry> = {};
+	for (const row of rows) {
+		try {
+			entries[row.date] = JSON.parse(row.data) as CheckinEntry;
+		} catch {
+			// skip unparseable rows rather than failing the whole read
+		}
+	}
+	return entries;
+}
+
+function readEntry(date: string): CheckinEntry | null {
+	const row = getDb().prepare('SELECT data FROM checkins WHERE date = ?').get(date) as
+		| { data: string }
+		| undefined;
+	if (!row) return null;
+	try {
+		return JSON.parse(row.data) as CheckinEntry;
+	} catch {
+		return null;
+	}
+}
+
+function mergeEntry(prev: CheckinEntry | null, patch: CheckinEntry): CheckinEntry {
+	const merged: CheckinEntry = { ...(prev ?? {}), ...patch };
+	if (prev?.gym && patch.gym && typeof patch.gym === 'object') {
+		merged.gym = { ...prev.gym, ...patch.gym };
+	}
+	return merged;
+}
+
+function writeEntry(date: string, entry: CheckinEntry): void {
+	const data = JSON.stringify(entry);
+	getDb()
+		.prepare(
+			`INSERT INTO checkins (date, data, updated_at) VALUES (?, ?, ?)
+			 ON CONFLICT(date) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
+		)
+		.run(date, data, new Date().toISOString());
+}
+
+// ------------------------------ brief storage ------------------------------
+
+const MAX_BRIEF_BYTES = 400_000;
+
+function ammanToday(): string {
+	return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Amman' });
+}
+
+function shiftDate(date: string, days: number): string {
+	const d = new Date(date + 'T12:00:00Z');
+	d.setUTCDate(d.getUTCDate() + days);
+	return d.toISOString().slice(0, 10);
+}
+
+function prettyDate(date: string): string {
+	return new Date(date + 'T12:00:00Z').toLocaleDateString('en-GB', {
+		timeZone: 'UTC',
+		weekday: 'long',
+		day: 'numeric',
+		month: 'long',
+	});
+}
+
+function readBriefFor(date: string): { html: string; label: string | null; updated_at: string } | null {
+	const row = getDb()
+		.prepare('SELECT html, label, updated_at FROM briefs WHERE date = ?')
+		.get(date) as { html: string; label: string | null; updated_at: string } | undefined;
+	return row ?? null;
+}
+
+function listBriefDates(limit = 60): string[] {
+	const rows = getDb()
+		.prepare('SELECT date FROM briefs ORDER BY date DESC LIMIT ?')
+		.all(limit) as Array<{ date: string }>;
+	return rows.map(r => r.date);
+}
+
+function writeBriefFor(date: string, html: string, label: string | null): void {
+	getDb()
+		.prepare(
+			`INSERT INTO briefs (date, html, label, updated_at) VALUES (?, ?, ?, ?)
+			 ON CONFLICT(date) DO UPDATE SET html = excluded.html, label = excluded.label, updated_at = excluded.updated_at`
+		)
+		.run(date, html, label, new Date().toISOString());
+}
+
+function readBrief(): { html: string; label: string | null; updated_at: string } | null {
+	const row = getDb().prepare('SELECT html, label, updated_at FROM brief WHERE id = 1').get() as
+		| { html: string; label: string | null; updated_at: string }
+		| undefined;
+	return row ?? null;
+}
+
+function writeBrief(html: string, label: string | null): void {
+	getDb()
+		.prepare(
+			`INSERT INTO brief (id, html, label, updated_at) VALUES (1, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET html = excluded.html, label = excluded.label, updated_at = excluded.updated_at`
+		)
+		.run(html, label, new Date().toISOString());
+}
+
+// ------------------------------ live rings ---------------------------------
+// All three rings can be written with tokens instead of fixed numbers, and the
+// server fills them from the database on every page load (index.ts re-syncs
+// with Whoop every 30 minutes; the open page re-polls /api/live every 5).
+//   strain    {{STRAIN}} {{STRAIN_DASH}} {{STRAIN_KCAL}} {{STRAIN_AT}}
+//   recovery  {{RECOVERY}} {{RECOVERY_DASH}} {{RECOVERY_COLOR}} {{RECOVERY_AT}} {{HRV}} {{RHR}}
+//   sleep     {{SLEEP_PCT}} {{SLEEP_DASH}} {{SLEEP_COLOR}} {{SLEEP_DUR}} {{SLEEP_AT}}
+// Values are looked up BY DAY, so a ring only ever shows the number that
+// belongs to the day being viewed. When today's recovery or sleep has not
+// arrived yet, the ring falls back to the newest one, turns grey, and its
+// caption says which day it belongs to — nothing is ever presented as today's
+// unless it is. Archived days look the day up the same way, so they stay
+// correct too; the old `live` column is kept only as a last-resort fallback.
+
+const RING_C = 326.7;
+const LIVE_STALE_MIN = 100;
+const MUTED_ARC = '#4A4462';
+
+interface RingSnapshot {
+	strain: number | null;
+	kcal: number | null;
+	strainAt: string;
+	strainStale: boolean;
+	strainIsDay: boolean;
+	strainDay: string;
+	recovery: number | null;
+	hrv: number | null;
+	rhr: number | null;
+	recoveryIsDay: boolean;
+	recoveryDay: string;
+	sleepPct: number | null;
+	sleepMs: number | null;
+	sleepIsDay: boolean;
+	sleepNight: string;
+}
+
+function ammanDateOf(iso: string): string {
+	const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+	return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-CA', { timeZone: 'Asia/Amman' });
+}
+
+function weekdayOf(date: string): string {
+	if (!date) return '';
+	return new Date(date + 'T12:00:00Z').toLocaleDateString('en-GB', { timeZone: 'UTC', weekday: 'long' });
+}
+
+function ammanClock(d: Date): string {
+	return d.toLocaleTimeString('en-GB', {
+		timeZone: 'Asia/Amman',
+		hour: '2-digit',
+		minute: '2-digit',
+	});
+}
+
+function parseSyncedAt(value: string | null): Date | null {
+	if (!value) return null;
+	const iso = value.includes('T') ? value : value.replace(' ', 'T') + 'Z';
+	const d = new Date(iso);
+	return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function fmtDuration(ms: number | null): string {
+	if (ms === null || !Number.isFinite(ms) || ms < 0) return '—';
+	const h = Math.floor(ms / 3_600_000);
+	const m = Math.floor((ms % 3_600_000) / 60_000);
+	return `${h}h ${String(m).padStart(2, '0')}m`;
+}
+
+type CycleRow = { start_time: string; strain: number | null; kilojoule: number | null; synced_at: string | null };
+type RecoveryRow = { created_at: string; recovery_score: number | null; hrv_rmssd: number | null; resting_hr: number | null };
+type SleepRow = { end_time: string; total_in_bed_milli: number | null; total_awake_milli: number | null; sleep_performance: number | null };
+
+function emptySnapshot(): RingSnapshot {
+	return {
+		strain: null, kcal: null, strainAt: '', strainStale: true, strainIsDay: false, strainDay: '',
+		recovery: null, hrv: null, rhr: null, recoveryIsDay: false, recoveryDay: '',
+		sleepPct: null, sleepMs: null, sleepIsDay: false, sleepNight: '',
+	};
+}
+
+// Build the numbers for one calendar day (Amman). For today, anything not yet
+// recorded falls back to the newest row and is flagged as not-this-day.
+function buildSnapshot(date: string, isToday: boolean): RingSnapshot {
+	const snap = emptySnapshot();
+	const now = new Date();
+	try {
+		const db = getDb();
+		const cycles = db
+			.prepare('SELECT start_time, strain, kilojoule, synced_at FROM cycles ORDER BY start_time DESC LIMIT 12')
+			.all() as CycleRow[];
+		let cycle = cycles.find(c => ammanDateOf(c.start_time) === date) ?? null;
+		snap.strainIsDay = cycle !== null;
+		if (!cycle && isToday && cycles.length) cycle = cycles[0];
+		if (cycle) {
+			snap.strain = typeof cycle.strain === 'number' ? cycle.strain : null;
+			snap.kcal = typeof cycle.kilojoule === 'number' ? Math.round(cycle.kilojoule / 4.184) : null;
+			snap.strainDay = weekdayOf(ammanDateOf(cycle.start_time));
+			const synced = parseSyncedAt(cycle.synced_at) ?? now;
+			snap.strainAt = ammanClock(synced);
+			snap.strainStale = (now.getTime() - synced.getTime()) / 60000 > LIVE_STALE_MIN;
+		}
+
+		const recs = db
+			.prepare('SELECT created_at, recovery_score, hrv_rmssd, resting_hr FROM recovery ORDER BY created_at DESC LIMIT 12')
+			.all() as RecoveryRow[];
+		let rec = recs.find(r => ammanDateOf(r.created_at) === date) ?? null;
+		snap.recoveryIsDay = rec !== null;
+		if (!rec && isToday && recs.length) rec = recs[0];
+		if (rec) {
+			snap.recovery = typeof rec.recovery_score === 'number' ? rec.recovery_score : null;
+			snap.hrv = typeof rec.hrv_rmssd === 'number' ? rec.hrv_rmssd : null;
+			snap.rhr = typeof rec.resting_hr === 'number' ? rec.resting_hr : null;
+			snap.recoveryDay = weekdayOf(ammanDateOf(rec.created_at));
+		}
+
+		const sleeps = db
+			.prepare('SELECT end_time, total_in_bed_milli, total_awake_milli, sleep_performance FROM sleep WHERE is_nap = 0 ORDER BY start_time DESC LIMIT 12')
+			.all() as SleepRow[];
+		let sl = sleeps.find(s => ammanDateOf(s.end_time) === date) ?? null;
+		snap.sleepIsDay = sl !== null;
+		if (!sl && isToday && sleeps.length) sl = sleeps[0];
+		if (sl) {
+			snap.sleepPct = typeof sl.sleep_performance === 'number' ? Math.round(sl.sleep_performance) : null;
+			const inBed = sl.total_in_bed_milli ?? null;
+			const awake = sl.total_awake_milli ?? 0;
+			snap.sleepMs = inBed === null ? null : Math.max(0, inBed - awake);
+			snap.sleepNight = weekdayOf(shiftDate(ammanDateOf(sl.end_time), -1));
+		}
+	} catch {
+		// never let a ring lookup break the page
+	}
+	return snap;
+}
+
+function ringDash(pct: number | null): string {
+	const p = pct === null ? 0 : Math.max(0, Math.min(1, pct));
+	const on = Math.round(p * RING_C * 10) / 10;
+	const off = Math.round((RING_C - on) * 10) / 10;
+	return `${on} ${off}`;
+}
+
+function recoveryColor(score: number | null): string {
+	if (score === null) return MUTED_ARC;
+	if (score >= 67) return 'var(--green)';
+	if (score >= 34) return 'var(--yellow)';
+	return 'var(--red)';
+}
+
+function recoveryWord(score: number | null): string {
+	if (score === null) return '';
+	if (score >= 67) return 'Green';
+	if (score >= 34) return 'Yellow';
+	return 'Red';
+}
+
+interface RingStrings {
+	strain: string; strainDash: string; strainKcal: string; strainAt: string;
+	recovery: string; recoveryDash: string; recoveryColor: string; recoveryAt: string;
+	hrv: string; rhr: string;
+	sleepPct: string; sleepDash: string; sleepColor: string; sleepDur: string; sleepAt: string;
+}
+
+function ringStrings(snap: RingSnapshot, isToday: boolean): RingStrings {
+	const dash = '—';
+	// strain
+	let strainAt: string;
+	if (snap.strain === null) strainAt = isToday ? 'not in yet' : 'no reading';
+	else if (!isToday) strainAt = 'final for the day';
+	else if (!snap.strainIsDay) strainAt = `${snap.strainDay}'s total · today not started`;
+	else if (snap.strainStale) strainAt = `as of ${snap.strainAt} · waiting on the watch`;
+	else strainAt = `as of ${snap.strainAt} · still counting`;
+	// recovery
+	const recFresh = snap.recovery !== null && (snap.recoveryIsDay || !isToday);
+	let recoveryAt: string;
+	if (snap.recovery === null) recoveryAt = isToday ? 'not in yet' : 'no score that day';
+	else if (!recFresh) recoveryAt = `${snap.recoveryDay}'s score · today's not in yet`;
+	else recoveryAt = isToday ? `${recoveryWord(snap.recovery)} · today` : `${recoveryWord(snap.recovery)} · that morning`;
+	// sleep
+	const slFresh = snap.sleepPct !== null && (snap.sleepIsDay || !isToday);
+	const dur = fmtDuration(snap.sleepMs);
+	let sleepAt: string;
+	if (snap.sleepPct === null) sleepAt = isToday ? 'last night not in yet' : 'no sleep recorded';
+	else if (!slFresh) sleepAt = `${dur} · ${snap.sleepNight} night · last night not in yet`;
+	else sleepAt = isToday ? `${dur} · last night` : `${dur} · that night`;
+	return {
+		strain: snap.strain === null ? dash : snap.strain.toFixed(1),
+		strainDash: ringDash(snap.strain === null ? null : snap.strain / 21),
+		strainKcal: snap.kcal === null ? dash : String(snap.kcal),
+		strainAt,
+		recovery: snap.recovery === null ? dash : String(Math.round(snap.recovery)),
+		recoveryDash: ringDash(snap.recovery === null ? null : snap.recovery / 100),
+		recoveryColor: recFresh ? recoveryColor(snap.recovery) : MUTED_ARC,
+		recoveryAt,
+		hrv: snap.hrv === null ? dash : snap.hrv.toFixed(1),
+		rhr: snap.rhr === null ? dash : String(Math.round(snap.rhr)),
+		sleepPct: snap.sleepPct === null ? dash : String(snap.sleepPct),
+		sleepDash: ringDash(snap.sleepPct === null ? null : snap.sleepPct / 100),
+		sleepColor: slFresh ? 'var(--sleep)' : MUTED_ARC,
+		sleepDur: dur,
+		sleepAt,
+	};
+}
+
+const TOKEN_MAP: Array<[string, keyof RingStrings]> = [
+	['{{STRAIN_DASH}}', 'strainDash'],
+	['{{STRAIN_KCAL}}', 'strainKcal'],
+	['{{STRAIN_AT}}', 'strainAt'],
+	['{{STRAIN}}', 'strain'],
+	['{{RECOVERY_DASH}}', 'recoveryDash'],
+	['{{RECOVERY_COLOR}}', 'recoveryColor'],
+	['{{RECOVERY_AT}}', 'recoveryAt'],
+	['{{RECOVERY}}', 'recovery'],
+	['{{HRV}}', 'hrv'],
+	['{{RHR}}', 'rhr'],
+	['{{SLEEP_PCT}}', 'sleepPct'],
+	['{{SLEEP_DASH}}', 'sleepDash'],
+	['{{SLEEP_COLOR}}', 'sleepColor'],
+	['{{SLEEP_DUR}}', 'sleepDur'],
+	['{{SLEEP_AT}}', 'sleepAt'],
+];
+
+function hasLiveTokens(html: string): boolean {
+	return html.includes('{{');
+}
+
+function applyLiveTokens(html: string, strings: RingStrings): string {
+	let out = html;
+	for (const [token, key] of TOKEN_MAP) {
+		if (out.includes(token)) out = out.split(token).join(strings[key]);
+	}
+	return out;
+}
+
+function saveLiveSnapshot(date: string, snap: RingSnapshot): void {
+	try {
+		getDb().prepare('UPDATE briefs SET live = ? WHERE date = ?').run(JSON.stringify(snap), date);
+	} catch {
+		// the snapshot is only a fallback for the archive; never break a page render
+	}
+}
+
+function readStoredSnapshot(date: string): RingSnapshot | null {
+	try {
+		const row = getDb().prepare('SELECT live FROM briefs WHERE date = ?').get(date) as
+			| { live: string | null }
+			| undefined;
+		if (!row || !row.live) return null;
+		const parsed = JSON.parse(row.live) as Partial<RingSnapshot>;
+		if (!parsed || typeof parsed !== 'object') return null;
+		return { ...emptySnapshot(), ...parsed };
+	} catch {
+		return null;
+	}
+}
+
+// Numbers for the page: today straight from the database; an archived day
+// from the database too, with the frozen snapshot only if the day has no rows.
+function snapshotForPage(date: string, isToday: boolean): RingSnapshot {
+	const fresh = buildSnapshot(date, isToday);
+	if (isToday) return fresh;
+	if (fresh.strainIsDay || fresh.recoveryIsDay || fresh.sleepIsDay) return fresh;
+	return readStoredSnapshot(date) ?? fresh;
+}
+
+// ------------------------------ MCP tools ----------------------------------
+
+export const checkinToolDefs = [
+	{
+		name: 'get_checkins',
+		description:
+			"Get Hamza's self-logged daily check-in entries (morning survey, after-training survey, plan changes, day notes) recorded on the server's check-in page. Returns JSON keyed by date (YYYY-MM-DD).",
+		inputSchema: {
+			type: 'object',
+			properties: {
+				days: { type: 'number', description: 'How many recent days to return (default: 60, max: 120)' },
+			},
+			required: [],
+		},
+	},
+	{
+		name: 'get_brief',
+		description:
+			"Get a performance-brief fragment with its label and last-updated time. Without a date it returns the one currently on the page (today's); pass a date to read an archived day. The result also lists which dates have a stored brief.",
+		inputSchema: {
+			type: 'object',
+			properties: {
+				date: { type: 'string', description: 'Optional YYYY-MM-DD; defaults to the latest brief' },
+			},
+			required: [],
+		},
+	},
+	{
+		name: 'publish_brief',
+		description:
+			"Replace the performance-brief fragment shown at the top of Hamza's page (above the daily check-in form). Pass an HTML FRAGMENT only — no <html>/<head>/<body>, no <script>, and no check-in form (the server renders that below it). The page's stylesheet already defines: mast, eyebrow, pill, dot, verdict, lede, why, tiles, tile, val, unit, note, waiting, card, sub, num, unlock, urow, uwhen (now/soon/later), notebox, chips. A <style> block for additional components is allowed. Start the fragment with <header class=\"mast\"> containing the date. The page updates instantly for anyone who opens it.",
+		inputSchema: {
+			type: 'object',
+			properties: {
+				html: { type: 'string', description: 'The brief HTML fragment' },
+				label: {
+					type: 'string',
+					description: 'Short label for this brief, e.g. "Friday 29 August · Day 3"',
+				},
+				date: {
+					type: 'string',
+					description:
+						'Optional YYYY-MM-DD (Amman). Defaults to today. Every brief is archived under its date and readers can page back through them, so use today for the daily rebuild and a past date only when backfilling.',
+				},
+			},
+			required: ['html'],
+		},
+	},
+];
+
+export function handleCheckinTool(
+	name: string,
+	args: Record<string, unknown>
+): { content: Array<{ type: 'text'; text: string }> } {
+	if (name === 'get_checkins') {
+		const raw = Number(args?.days);
+		const days = Number.isFinite(raw) && raw >= 1 ? Math.min(Math.floor(raw), 120) : 60;
+		const entries = readEntries(days);
+		const count = Object.keys(entries).length;
+		const text =
+			count === 0
+				? 'No check-in entries logged yet.'
+				: `Check-in log — last ${days} days, ${count} logged day(s):\n\n` +
+				  JSON.stringify({ entries }, null, 1);
+		return { content: [{ type: 'text' as const, text }] };
+	}
+
+	if (name === 'get_brief') {
+		const wanted = typeof args?.date === 'string' && validDate(args.date) ? args.date : null;
+		const dates = listBriefDates(30);
+		const archive = dates.length ? ` | archived: ${dates.join(', ')}` : '';
+		if (wanted) {
+			const past = readBriefFor(wanted);
+			return {
+				content: [
+					{
+						type: 'text' as const,
+						text: past
+							? `Brief for ${wanted} — label: ${past.label ?? '(none)'} — updated: ${past.updated_at}${archive}\n\n${past.html}`
+							: `No brief stored for ${wanted}.${archive}`,
+					},
+				],
+			};
+		}
+		const brief = readBriefFor(ammanToday()) ?? readBrief();
+		const text = brief
+			? `Current brief (${ammanToday()}) — label: ${brief.label ?? '(none)'} — updated: ${brief.updated_at}${archive}\n\n${brief.html}`
+			: `No brief published yet. The page shows its built-in placeholder.${archive}`;
+		return { content: [{ type: 'text' as const, text }] };
+	}
+
+	if (name === 'publish_brief') {
+		const html = typeof args?.html === 'string' ? args.html : '';
+		if (!html.trim()) {
+			return { content: [{ type: 'text' as const, text: 'Error: html is required and was empty.' }] };
+		}
+		if (Buffer.byteLength(html, 'utf8') > MAX_BRIEF_BYTES) {
+			return {
+				content: [{ type: 'text' as const, text: `Error: brief too large (max ${MAX_BRIEF_BYTES} bytes).` }],
+			};
+		}
+		if (/<\s*script\b/i.test(html)) {
+			return {
+				content: [{ type: 'text' as const, text: 'Error: <script> is not allowed in the brief fragment — the page has its own script.' }],
+			};
+		}
+		const label = typeof args?.label === 'string' && args.label.trim() ? args.label.trim() : null;
+		const today = ammanToday();
+		const date = typeof args?.date === 'string' && validDate(args.date) ? args.date : today;
+		writeBriefFor(date, html, label);
+		if (date === today) writeBrief(html, label);
+		return {
+			content: [{ type: 'text' as const, text: `Brief published for ${date} (${label ?? 'no label'})${date === today ? ' — live on the page now.' : ' — archived; reachable with the date arrows.'}` }],
+		};
+	}
+
+	return { content: [{ type: 'text' as const, text: `Unknown check-in tool: ${name}` }] };
+}
+
+// --------------------- day navigation & archived days ----------------------
+
+function escHtml(v: unknown): string {
+	return String(v)
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
+function dayLink(date: string): string {
+	return `/checkin?key=${encodeURIComponent(CHECKIN_KEY)}&date=${date}`;
+}
+
+function navHtml(date: string, today: string): string {
+	const isToday = date === today;
+	const prev = shiftDate(date, -1);
+	const next = shiftDate(date, 1);
+	const back = isToday ? '' : `<a class="dn-t" href="${dayLink(today)}">Today</a>`;
+	const fwd = isToday
+		? '<span class="dn-b off" aria-hidden="true">&rsaquo;</span>'
+		: `<a class="dn-b" href="${dayLink(next)}" aria-label="Next day">&rsaquo;</a>`;
+	return `<nav class="dnav">
+	<a class="dn-b" href="${dayLink(prev)}" aria-label="Previous day">&lsaquo;</a>
+	<div class="dn-c"><span class="dn-d">${isToday ? 'Today' : escHtml(prettyDate(date))}</span>${back}</div>
+	${fwd}
+</nav>`;
+}
+
+const LOG_FIELDS: Array<[string, string]> = [
+	['energy', 'Energy'],
+	['feltStress', 'Felt stress'],
+	['soreness', 'Soreness'],
+	['lateCaffeine', 'Caffeine after 2pm'],
+	['cookiesPrev', 'Cookies yesterday'],
+	['cookiesPrevCount', 'Cookies \u00b7 times'],
+	['stress', 'School & life load'],
+	['school', 'School day'],
+	['weightKg', 'Morning weight'],
+];
+
+const GYM_FIELDS: Array<[string, string]> = [
+	['gymType', 'Trained'],
+	['gymTime', 'When'],
+	['gymLength', 'Length'],
+	['gymFeel', 'Felt'],
+	['gymPump', 'Pump'],
+	['preMeal', 'Ate before'],
+	['eatingDay', 'Eating that day'],
+	['preSalt', 'Salt before'],
+	['cookiesPre', 'Cookies before session'],
+	['cookiesPreGap', 'Cookies \u00b7 how long before'],
+	['topSet', 'Top set'],
+];
+
+const PRETTY: Record<string, string> = {
+	'14-16': '2\u20134pm', '16-18': '4\u20136pm', '18-20': '6\u20138pm', 'after-20': 'after 8pm', none: 'None',
+	yes: 'Yes', no: 'No', holiday: 'Holiday', low: 'Light', normal: 'Normal', high: 'Heavy', exams: 'Exams',
+	lower: 'Lower', upper: 'Upper', 'upper-arms': 'Upper \u00b7 arms', full: 'Full body', rpm: 'RPM / cardio',
+	other: 'Other', rest: "Didn't train", morning: 'Morning', 'after-school': 'After school',
+	evening: 'Evening', night: 'Night', 'under-60': 'Under 1h', '60-90': '1\u20131.5h', '90-120': '1.5\u20132h',
+	'over-120': 'Over 2h', weak: 'Weak day', off: 'Slightly off', good: 'Good', strong: 'Unusually strong',
+	flat: 'Flat', great: 'Great pump', fasted: 'Basically nothing', snack: 'Light snack', meal: 'Full meal',
+	'big-close': 'Big meal right before', big: 'Big day', 'extra-session': 'Extra gym day',
+	'swapped-days': 'Swapped days', 'unplanned-rest': 'Rest day', missed: 'Missed a session',
+	'new-split': 'New split', travel: 'Travelling',
+	midday: 'Midday 12\u20135', 'under-1h': 'Under 1h', '1-3h': '1\u20133h', '3-6h': '3\u20136h',
+	'6-12h': '6\u201312h', '12-24h': '12\u201324h',
+};
+
+function pretty(v: unknown): string {
+	const raw = String(v);
+	return PRETTY[raw] ?? raw;
+}
+
+function loggedRows(entry: CheckinEntry | null): string {
+	if (!entry) return '<p class="past-none">Nothing was logged on this day.</p>';
+	const rows: string[] = [];
+	for (const [k, lbl] of LOG_FIELDS) {
+		const v = entry[k];
+		if (v !== undefined && v !== null && v !== '') rows.push(`<div class="lrow"><span class="lk">${lbl}</span><span class="lv">${escHtml(pretty(v))}</span></div>`);
+	}
+	const gym = entry.gym;
+	if (gym && typeof gym === 'object') {
+		for (const [k, lbl] of GYM_FIELDS) {
+			const v = (gym as Record<string, unknown>)[k];
+			if (v !== undefined && v !== null && v !== '') rows.push(`<div class="lrow"><span class="lk">${lbl}</span><span class="lv">${escHtml(pretty(v))}</span></div>`);
+		}
+	}
+	const ct = entry.cookiesPrevTimes;
+	if (Array.isArray(ct) && ct.length) rows.push(`<div class="lrow"><span class="lk">Cookies \u00b7 when</span><span class="lv">${escHtml(ct.map(pretty).join(', '))}</span></div>`);
+	const sc = entry.scheduleChange;
+	if (Array.isArray(sc) && sc.length) rows.push(`<div class="lrow"><span class="lk">Plan change</span><span class="lv">${escHtml(sc.map(pretty).join(', '))}</span></div>`);
+	const notes: string[] = [];
+	for (const k of ['note', 'scheduleNote', 'dayNote']) {
+		const v = entry[k];
+		if (typeof v === 'string' && v.trim()) notes.push(`<p class="past-q">&ldquo;${escHtml(v.trim())}&rdquo;</p>`);
+	}
+	if (!rows.length && !notes.length) return '<p class="past-none">Nothing was logged on this day.</p>';
+	return rows.join('') + notes.join('');
+}
+
+function missingBriefHtml(date: string): string {
+	return `<section class="pastcard">
+	<div class="past-h">${escHtml(prettyDate(date))}</div>
+	<p class="past-none">No brief was written for this day &mdash; the page only started keeping a dated archive on 29 August 2026.</p>
+</section>`;
+}
+
+function pastLogHtml(date: string, entry: CheckinEntry | null): string {
+	return `<section class="pastcard">
+	<div class="past-h">What was logged &middot; ${escHtml(prettyDate(date))}</div>
+	${loggedRows(entry)}
+	<p class="past-none" style="margin-top:16px">This is an archived day, so it is read-only. <a class="dn-t" href="${dayLink(ammanToday())}">Go to today</a> to log.</p>
+</section>`;
+}
+
+function stripLiveParts(page: string): string {
+	return page
+		.replace(/<!--FORM_START-->[\s\S]*?<!--FORM_END-->/, '<!--PASTLOG-->')
+		.replace(/<!--SCRIPT_START-->[\s\S]*?<!--SCRIPT_END-->/, '');
+}
+
+// ------------------------------ HTTP routes --------------------------------
+
+export function registerCheckinRoutes(app: Express): void {
+	app.get('/checkin', (req: Request, res: Response) => {
+		if (!keyOk(req)) {
+			res.status(403).send('Not available.');
+			return;
+		}
+		res.setHeader('Content-Type', 'text/html; charset=utf-8');
+		res.setHeader('Cache-Control', 'no-store');
+		res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+		const today = ammanToday();
+		const asked = req.query.date;
+		let date = validDate(asked) ? asked : today;
+		if (date > today) date = today;
+		const isToday = date === today;
+		const stored = readBriefFor(date) ?? (isToday ? readBrief() : null);
+		let briefHtml = stored ? stored.html : isToday ? DEFAULT_BRIEF : missingBriefHtml(date);
+		if (hasLiveTokens(briefHtml)) {
+			const snap = snapshotForPage(date, isToday);
+			briefHtml = applyLiveTokens(briefHtml, ringStrings(snap, isToday));
+			if (isToday) saveLiveSnapshot(date, snap);
+		}
+		let page = CHECKIN_PAGE.replace('<!--NAV-->', () => navHtml(date, today)).replace(
+			'<!--BRIEF-->',
+			() => briefHtml
+		);
+		if (!isToday) {
+			page = stripLiveParts(page).replace('<!--PASTLOG-->', () => pastLogHtml(date, readEntry(date)));
+		}
+		res.send(page);
+	});
+
+	app.get('/api/live', (req: Request, res: Response) => {
+		if (!keyOk(req)) {
+			res.status(403).json({ error: 'forbidden' });
+			return;
+		}
+		const today = ammanToday();
+		const snap = buildSnapshot(today, true);
+		const s = ringStrings(snap, true);
+		res.setHeader('Cache-Control', 'no-store');
+		res.json({
+			date: today,
+			strain: snap.strain,
+			text: s.strain,
+			dash: s.strainDash,
+			kcal: snap.kcal,
+			note: s.strainAt,
+			at: snap.strainAt,
+			recovery: snap.recovery,
+			recoveryText: s.recovery,
+			recoveryDash: s.recoveryDash,
+			recoveryColor: s.recoveryColor,
+			recoveryNote: s.recoveryAt,
+			recoveryIsToday: snap.recoveryIsDay,
+			hrv: s.hrv,
+			rhr: s.rhr,
+			sleepPct: s.sleepPct,
+			sleepDash: s.sleepDash,
+			sleepColor: s.sleepColor,
+			sleepDur: s.sleepDur,
+			sleepNote: s.sleepAt,
+			sleepIsToday: snap.sleepIsDay,
+		});
+	});
+
+	app.get('/api/checkins', (req: Request, res: Response) => {
+		if (!keyOk(req)) {
+			res.status(403).json({ error: 'forbidden' });
+			return;
+		}
+		const raw = Number(req.query.days);
+		const days = Number.isFinite(raw) && raw >= 1 ? Math.min(Math.floor(raw), 120) : 60;
+		res.json({ entries: readEntries(days) });
+	});
+
+	app.post('/api/checkin', (req: Request, res: Response) => {
+		if (!keyOk(req)) {
+			res.status(403).json({ error: 'forbidden' });
+			return;
+		}
+		const body = (req.body ?? {}) as { date?: unknown; patch?: unknown; clear?: unknown };
+		if (!validDate(body.date)) {
+			res.status(400).json({ error: 'bad date' });
+			return;
+		}
+		if (body.clear === true) {
+			getDb().prepare('DELETE FROM checkins WHERE date = ?').run(body.date);
+			res.json({ ok: true, entry: null });
+			return;
+		}
+		if (typeof body.patch !== 'object' || body.patch === null || Array.isArray(body.patch)) {
+			res.status(400).json({ error: 'bad patch' });
+			return;
+		}
+		const merged = mergeEntry(readEntry(body.date), body.patch as CheckinEntry);
+		if (JSON.stringify(merged).length > MAX_ENTRY_BYTES) {
+			res.status(413).json({ error: 'entry too large' });
+			return;
+		}
+		writeEntry(body.date, merged);
+		res.json({ ok: true, entry: merged });
+	});
+}
+
+// ------------------------------ the page -----------------------------------
+// Always-dark, phone-first. All JS uses string concatenation (no template
+// literals) so this file's template literal stays clean. The morning runs
+// replace the brief section via the publish_brief MCP tool; the server
+// injects it where <!--BRIEF--> sits. Until the first publish, a built-in
+// placeholder masthead renders instead.
+
+const DEFAULT_BRIEF = `<header class="mast">
+  <div>
+    <div class="eyebrow">Performance brief &middot; Hamza</div>
+    <h1 id="hd-date">Today</h1>
+  </div>
+  <div class="pill"><span class="dot"></span>Live &middot; calibrating</div>
+</header>
+<section class="card">
+  <p class="sub">The first brief lands here with the next morning rebuild (07:30, and 12:30 on
+  Fri/Sat). Your logs below already count.</p>
+</section>`;
+
+const CHECKIN_PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Hamza — Daily Log</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Newsreader is the only web font the design still uses, and it loads
+     non-blocking: if Google Fonts is slow or unreachable the page paints
+     immediately in Georgia instead of hanging on it. -->
+<link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400&display=swap">
+<style>
+:root{
+  color-scheme: dark;
+  --plane:#0B0D12; --surface:#15181F; --surface-2:#1B1F28;
+  --ink:#F2F4F7; --ink-2:#A7AEBB; --muted:#7C8391;
+  --rule:#242935; --rule-strong:#333A48;
+  --teal:#23A3B2; --teal-ink:#4FC0CC; --teal-wash:rgba(35,163,178,.14);
+  --good:#0CA30C; --good-wash:rgba(12,163,12,.13); --good-ink:#37C337;
+  --warn:#FAB219; --warn-wash:rgba(250,178,25,.14); --warn-ink:#FAB219;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--plane);color:var(--ink);
+  font-family:"Archivo","Helvetica Neue",Arial,sans-serif;font-size:15px;line-height:1.6;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:820px;margin:0 auto;padding:28px 20px 80px;display:flex;flex-direction:column;gap:18px}
+.eyebrow{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:10.5px;font-weight:500;
+  letter-spacing:.13em;text-transform:uppercase;color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:12px;padding:22px 24px}
+h2{font-size:15.5px;font-weight:600;letter-spacing:-.006em;margin:0 0 6px}
+p{margin:0}
+.sub{color:var(--ink-2);font-size:13.5px}
+.num{font-variant-numeric:tabular-nums}
+.mast{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;
+  padding-bottom:16px;border-bottom:1px solid var(--rule-strong)}
+.mast h1{font-size:19px;font-weight:600;letter-spacing:-.01em;margin:4px 0 0}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px 5px 9px;border-radius:999px;
+  font-size:12.5px;font-weight:600;white-space:nowrap;background:var(--teal-wash);color:var(--teal-ink)}
+.pill .dot{width:9px;height:9px;border-radius:50%;background:var(--teal);flex:none}
+.pill.good{background:var(--good-wash);color:var(--good-ink)}
+.pill.good .dot{background:var(--good)}
+.pill.warn{background:var(--warn-wash);color:var(--warn-ink)}
+.pill.warn .dot{background:var(--warn)}
+.verdict{background:var(--teal-wash);border:1px solid rgba(35,163,178,.34);
+  border-radius:12px;padding:24px 26px 22px}
+.verdict .lede{font-family:"Newsreader",Georgia,serif;font-weight:300;font-size:27px;line-height:1.3;
+  letter-spacing:-.011em;margin:8px 0 0;text-wrap:balance}
+.verdict .lede em{font-style:italic}
+.verdict .why{margin-top:15px;font-size:13.5px;line-height:1.62;color:var(--ink-2);max-width:62ch}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media (max-width:680px){.tiles{grid-template-columns:1fr}}
+.tile{background:var(--surface);border:1px solid var(--rule);border-radius:12px;padding:16px 18px 16px;min-width:0}
+.tile .val{font-family:"Newsreader",Georgia,serif;font-weight:400;font-size:44px;line-height:1.05;
+  letter-spacing:-.02em;margin-top:8px;font-variant-numeric:tabular-nums}
+.tile .unit{font-family:"IBM Plex Mono",monospace;font-size:13px;color:var(--muted);margin-left:3px}
+.tile .note{font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--ink-2);margin-top:8px}
+.waiting{border-style:dashed;background:transparent}
+.waiting .val{color:var(--muted);font-size:34px;letter-spacing:0}
+.unlock{display:flex;flex-direction:column}
+.urow{display:grid;grid-template-columns:118px 1fr;gap:18px;padding:15px 0;border-top:1px solid var(--rule)}
+.urow:first-of-type{border-top:none;padding-top:4px}
+@media (max-width:560px){.urow{grid-template-columns:1fr;gap:4px}}
+.uwhen{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+  padding-top:3px}
+.uwhen.now{color:var(--good-ink);font-weight:600}
+.uwhen.soon{color:var(--teal-ink);font-weight:600}
+.uwhen.later{color:var(--muted)}
+.urow h3{font-size:14px;font-weight:600;margin:0 0 3px;letter-spacing:-.004em}
+.urow p{font-size:13px;color:var(--ink-2);max-width:62ch}
+.notebox{border-radius:10px;padding:14px 16px;font-size:13px;line-height:1.6;margin-top:16px;
+  background:var(--warn-wash);color:var(--ink-2)}
+.notebox b{color:var(--warn-ink);font-weight:600}
+.ci-tabs{display:flex;gap:6px;margin-top:14px;background:var(--surface-2);border:1px solid var(--rule);
+  border-radius:10px;padding:4px;width:fit-content}
+.ci-tabs button{font-family:"Archivo",sans-serif;font-size:13.5px;font-weight:600;padding:8px 16px;
+  border:none;border-radius:7px;background:transparent;color:var(--muted);cursor:pointer}
+.ci-tabs button.on{background:var(--teal-wash);color:var(--teal-ink)}
+.ci-q{margin-top:16px}
+.ci-q label{display:block;font-size:13.5px;font-weight:600;margin-bottom:8px;letter-spacing:-.003em}
+.ci-q .opt{font-weight:400;color:var(--muted);font-size:12px}
+.chips{display:flex;flex-wrap:wrap;gap:7px}
+.chips button{font-family:"IBM Plex Mono",monospace;font-size:12.5px;padding:7px 12px;border-radius:999px;
+  border:1px solid var(--rule-strong);background:var(--surface-2);color:var(--ink-2);cursor:pointer;min-width:38px}
+.chips button.on{background:var(--teal-wash);border-color:var(--teal);color:var(--teal-ink);font-weight:600}
+.ci-q input[type=text]{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--rule-strong);
+  background:var(--surface-2);color:var(--ink);font-family:"Archivo",sans-serif;font-size:14px}
+.ci-btn{margin-top:20px;width:100%;padding:13px;border-radius:10px;border:none;background:var(--teal);
+  color:#06181b;font-family:"Archivo",sans-serif;font-size:14.5px;font-weight:700;cursor:pointer;letter-spacing:.01em}
+.ci-btn:disabled{opacity:.55;cursor:default}
+.ci-msg{margin-top:10px;font-size:13px;color:var(--ink-2);min-height:18px}
+.ci-status{margin-top:12px}
+.ci-done{background:var(--good-wash);color:var(--good-ink);border-radius:10px;padding:12px 14px;
+  font-size:13.5px;font-weight:600}
+.ci-done span{font-weight:400;color:var(--ink-2);display:block;margin-top:2px;font-size:12.5px}
+#ci-history{margin-top:18px}
+#ci-history .hrow{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-top:1px solid var(--rule);
+  font-size:12.5px;color:var(--ink-2)}
+#ci-history .hd{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted);flex:none;width:86px}
+#ci-history .eyebrow{margin-bottom:6px}
+.ci-details{margin-top:18px;border:1px dashed var(--rule-strong);border-radius:10px;padding:12px 14px}
+.ci-details summary{cursor:pointer;font-size:13.5px;font-weight:600;color:var(--ink-2);list-style:none}
+.ci-details summary::-webkit-details-marker{display:none}
+.ci-details summary::before{content:"+";display:inline-block;width:18px;color:var(--teal-ink);font-weight:700}
+.ci-details[open] summary::before{content:"\\2212"}
+.ci-details .opt{font-weight:400;color:var(--muted);font-size:12px}
+#ci-todo{background:var(--warn-wash);border:1px solid rgba(250,178,25,.35);border-radius:12px;
+  padding:14px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+#ci-todo .t{font-size:13.5px;font-weight:600;color:var(--warn-ink);flex:none}
+#ci-todo .items{display:flex;gap:8px;flex-wrap:wrap}
+#ci-todo button{display:inline-flex;align-items:center;gap:8px;font-family:"Archivo",sans-serif;
+  font-size:13px;font-weight:600;padding:8px 14px;border-radius:999px;cursor:pointer;
+  border:1px solid rgba(250,178,25,.45);background:transparent;color:var(--ink)}
+#ci-todo button::before{content:"";width:14px;height:14px;border-radius:50%;
+  border:2px solid var(--warn);flex:none}
+#ci-todo .done-note{font-size:12px;color:var(--muted)}
+#ci-todo button.restbtn{border-style:dashed;border-color:var(--rule-strong);color:var(--ink-2);font-weight:500}
+#ci-todo button.restbtn::before{display:none}
+footer{border-top:1px solid var(--rule);padding-top:14px;color:var(--muted);font-size:12px;max-width:68ch}
+footer b{color:var(--ink-2)}
+/* date navigation + archived-day blocks */
+.dnav{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.dnav .dn-b{display:grid;place-items:center;width:40px;height:40px;border-radius:999px;flex:none;
+  border:1px solid var(--rule-strong);color:var(--ink);text-decoration:none;font-size:20px;line-height:1}
+.dnav .dn-b.off{opacity:.28}
+.dnav .dn-c{display:flex;flex-direction:column;align-items:center;gap:3px;text-align:center;min-width:0}
+.dnav .dn-d{font-size:12px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-2)}
+.dnav .dn-t{font-size:12px;color:var(--purple-soft,#A78BFA);text-decoration:none}
+.pastcard{background:var(--surface);border:1px solid var(--rule);border-radius:18px;padding:22px;margin-top:14px}
+.pastcard .past-h{font-size:11.5px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--purple-soft,#A78BFA);margin-bottom:14px}
+.pastcard .lrow{display:flex;align-items:baseline;justify-content:space-between;gap:16px;padding:12px 0;
+  border-bottom:1px solid var(--rule)}
+.pastcard .lrow:last-of-type{border-bottom:none}
+.pastcard .lk{font-size:14px;color:var(--muted)}
+.pastcard .lv{font-size:15px;color:var(--ink);font-weight:500;text-align:right}
+.pastcard .past-none{font-size:14px;color:var(--ink-2);line-height:1.6}
+.pastcard .past-q{margin-top:14px;padding-left:16px;border-left:2px solid var(--purple,#7C3AED);
+  font-size:15px;line-height:1.55;color:var(--ink-2)}
+:focus-visible{outline:2px solid var(--teal);outline-offset:2px;border-radius:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!--NAV-->
+
+<!--BRIEF-->
+
+<!--FORM_START-->
+<section class="card" id="checkin">
+  <div class="eyebrow" style="margin-bottom:4px">Daily check-in &middot; Hamza</div>
+  <h2 style="margin-bottom:2px">Two quick logs a day &mdash; the analysis runs on these</h2>
+  <p class="sub" style="max-width:62ch">Morning one with breakfast, training one on the way out of
+    the gym. Answers save straight to the server and feed the next morning's brief.</p>
+  <div class="ci-tabs" role="tablist">
+    <button type="button" class="on" data-tab="am">Morning</button>
+    <button type="button" data-tab="gym">After training</button>
+  </div>
+  <div id="ci-status" class="ci-status"></div>
+
+  <form id="ci-form" onsubmit="return false">
+  <div class="ci-pane" data-pane="am">
+    <div class="ci-q"><label>How sore are you overall right now?</label>
+      <div class="chips" data-name="soreness" data-single>
+        <button type="button" data-v="0">0</button><button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4">4</button><button type="button" data-v="5">5</button><button type="button" data-v="6">6</button><button type="button" data-v="7">7</button><button type="button" data-v="8">8</button><button type="button" data-v="9">9</button><button type="button" data-v="10">10</button>
+      </div></div>
+    <div class="ci-q"><label>Where? <span class="opt">tap all that apply</span></label>
+      <div class="chips" data-name="soreWhere">
+        <button type="button" data-v="quads">Quads</button><button type="button" data-v="hamstrings">Hamstrings</button><button type="button" data-v="lower-back">Lower back</button><button type="button" data-v="upper-back">Upper back</button><button type="button" data-v="chest">Chest</button><button type="button" data-v="shoulders">Shoulders</button><button type="button" data-v="arms">Arms</button><button type="button" data-v="back-stiff">Back feels stiff</button>
+      </div></div>
+    <div class="ci-q"><label>Energy this morning?</label>
+      <div class="chips" data-name="energy" data-single>
+        <button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4">4</button><button type="button" data-v="5">5</button><button type="button" data-v="6">6</button><button type="button" data-v="7">7</button><button type="button" data-v="8">8</button><button type="button" data-v="9">9</button><button type="button" data-v="10">10</button>
+      </div></div>
+    <div class="ci-q"><label>How stressed do you feel? <span class="opt">1 calm &mdash; 10 maxed out</span></label>
+      <div class="chips" data-name="feltStress" data-single>
+        <button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4">4</button><button type="button" data-v="5">5</button><button type="button" data-v="6">6</button><button type="button" data-v="7">7</button><button type="button" data-v="8">8</button><button type="button" data-v="9">9</button><button type="button" data-v="10">10</button>
+      </div></div>
+    <div class="ci-q"><label>Is today a school day?</label>
+      <div class="chips" data-name="school" data-single>
+        <button type="button" data-v="yes">Yes</button><button type="button" data-v="no">No / weekend</button><button type="button" data-v="holiday">Holiday / break</button>
+      </div></div>
+    <div class="ci-q"><label>School / life load today?</label>
+      <div class="chips" data-name="stress" data-single>
+        <button type="button" data-v="low">Light</button><button type="button" data-v="normal">Normal</button><button type="button" data-v="high">Heavy</button><button type="button" data-v="exams">Exams / deadline</button>
+      </div></div>
+    <div class="ci-q"><label>Yesterday &mdash; caffeine after 2pm?</label>
+      <div class="chips" data-name="lateCaffeine" data-single>
+        <button type="button" data-v="none">None</button><button type="button" data-v="14-16">2&ndash;4pm</button><button type="button" data-v="16-18">4&ndash;6pm</button><button type="button" data-v="18-20">6&ndash;8pm</button><button type="button" data-v="after-20">After 8pm</button>
+      </div></div>
+    <div class="ci-q"><label>Cookies yesterday?</label>
+      <div class="chips" data-name="cookiesPrev" data-single>
+        <button type="button" data-v="no">No</button><button type="button" data-v="yes">Yes</button>
+      </div></div>
+    <div class="ci-q ck-am"><label>What time? <span class="opt">tap all that apply</span></label>
+      <div class="chips" data-name="cookiesPrevTimes">
+        <button type="button" data-v="morning">Morning</button><button type="button" data-v="midday">Midday 12&ndash;5</button><button type="button" data-v="evening">Evening 5&ndash;9</button><button type="button" data-v="night">Night, after 9</button>
+      </div></div>
+    <div class="ci-q ck-am"><label>How many times?</label>
+      <div class="chips" data-name="cookiesPrevCount" data-single>
+        <button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4+">4+</button>
+      </div></div>
+    <div class="ci-q"><label>Morning weight <span class="opt">optional &mdash; only if you weighed, kg</span></label>
+      <input type="text" id="ci-weight" inputmode="decimal" placeholder="e.g. 80.4" maxlength="6"></div>
+    <div class="ci-q"><label>Anything else? <span class="opt">optional &mdash; sick, slept badly, big meal late&hellip;</span></label>
+      <input type="text" id="ci-note" placeholder="" maxlength="240"></div>
+    <button class="ci-btn" type="button" data-save="am">Save morning log</button>
+  </div>
+
+  <div class="ci-pane" data-pane="gym" hidden>
+    <div class="ci-q"><label>What did you train today?</label>
+      <div class="chips" data-name="gymType" data-single>
+        <button type="button" data-v="lower">Lower</button><button type="button" data-v="upper">Upper</button><button type="button" data-v="upper-arms">Upper &middot; arms</button><button type="button" data-v="full">Full body</button><button type="button" data-v="rpm">RPM / cardio</button><button type="button" data-v="other">Other</button><button type="button" data-v="rest">Didn't train</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>When did you train?</label>
+      <div class="chips" data-name="gymTime" data-single>
+        <button type="button" data-v="morning">Morning</button><button type="button" data-v="after-school">Straight after school</button><button type="button" data-v="evening">Evening 5&ndash;8</button><button type="button" data-v="night">Night, after 8</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>How long was the session?</label>
+      <div class="chips" data-name="gymLength" data-single>
+        <button type="button" data-v="under-60">Under 1h</button><button type="button" data-v="60-90">1&ndash;1.5h</button><button type="button" data-v="90-120">1.5&ndash;2h</button><button type="button" data-v="over-120">Over 2h</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>How strong did you feel?</label>
+      <div class="chips" data-name="gymFeel" data-single>
+        <button type="button" data-v="weak">Weak day</button><button type="button" data-v="off">Slightly off</button><button type="button" data-v="normal">Normal</button><button type="button" data-v="good">Good</button><button type="button" data-v="strong">Unusually strong</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Pump / fullness?</label>
+      <div class="chips" data-name="gymPump" data-single>
+        <button type="button" data-v="flat">Flat</button><button type="button" data-v="normal">Normal</button><button type="button" data-v="great">Great pump</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Eating before training?</label>
+      <div class="chips" data-name="preMeal" data-single>
+        <button type="button" data-v="fasted">Basically nothing</button><button type="button" data-v="snack">Light snack</button><button type="button" data-v="meal">Full meal 1&ndash;2h before</button><button type="button" data-v="big-close">Big meal right before</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Eating overall today?</label>
+      <div class="chips" data-name="eatingDay" data-single>
+        <button type="button" data-v="low">Under-ate</button><button type="button" data-v="normal">Normal</button><button type="button" data-v="big">Big bulking day</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Pre-workout?</label>
+      <div class="chips" data-name="preworkout" data-single>
+        <button type="button" data-v="no">No</button><button type="button" data-v="yes">Yes</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Spoon of salt before training?</label>
+      <div class="chips" data-name="preSalt" data-single>
+        <button type="button" data-v="no">No</button><button type="button" data-v="yes">Yes</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Cookies before this workout?</label>
+      <div class="chips" data-name="cookiesPre" data-single>
+        <button type="button" data-v="no">No</button><button type="button" data-v="yes">Yes</button>
+      </div></div>
+    <div class="ci-q gym-only ck-gym"><label>How long before?</label>
+      <div class="chips" data-name="cookiesPreGap" data-single>
+        <button type="button" data-v="under-1h">Under 1h</button><button type="button" data-v="1-3h">1&ndash;3h</button><button type="button" data-v="3-6h">3&ndash;6h</button><button type="button" data-v="6-12h">6&ndash;12h</button><button type="button" data-v="12-24h">12&ndash;24h</button>
+      </div></div>
+    <div class="ci-q gym-only"><label>Top set of the day <span class="opt">optional</span></label>
+      <input type="text" id="ci-topset" placeholder="e.g. bench 107.5 x 5" maxlength="120"></div>
+    <div class="ci-q gym-only"><label>Anything about the session? <span class="opt">optional</span></label>
+      <input type="text" id="ci-gymnote" placeholder="e.g. squat bottom felt easier, gym was packed" maxlength="240"></div>
+    <button class="ci-btn" type="button" data-save="gym">Save training log</button>
+  </div>
+
+  <details class="ci-details">
+    <summary>Plan changed? <span class="opt">only open this when your week is different from normal</span></summary>
+    <div class="ci-q"><label>What changed?</label>
+      <div class="chips" data-name="scheduleChange">
+        <button type="button" data-v="extra-session">Extra gym day</button>
+        <button type="button" data-v="swapped-days">Swapped days around</button>
+        <button type="button" data-v="unplanned-rest">Taking a rest day</button>
+        <button type="button" data-v="missed">Missed a session</button>
+        <button type="button" data-v="new-split">New split this week</button>
+        <button type="button" data-v="travel">Travelling</button>
+      </div></div>
+    <div class="ci-q"><label>What's the plan now? <span class="opt">optional</span></label>
+      <input type="text" id="ci-plannote" placeholder="" maxlength="200"></div>
+    <button class="ci-btn" type="button" data-save="plan" style="margin-top:12px">Save plan change</button>
+  </details>
+  <details class="ci-details">
+    <summary>How was the day? <span class="opt">optional &mdash; a night comment about anything unique</span></summary>
+    <div class="ci-q"><label>Say anything about today <span class="opt">bad day, tiring, something happened, felt great, whatever's worth remembering</span></label>
+      <input type="text" id="ci-daynote" placeholder="" maxlength="300"></div>
+    <button class="ci-btn" type="button" data-save="night" style="margin-top:12px">Save day comment</button>
+  </details>
+  <p id="ci-msg" class="ci-msg"></p>
+  </form>
+  <div id="ci-history"></div>
+</section>
+<!--FORM_END-->
+
+<footer>
+  <b>One page, live data.</b> The brief above rebuilds from Hamza's Whoop every morning at 07:30
+  &mdash; and again at 12:30 on Fridays and Saturdays, since weekend sleep runs late. The check-in
+  answers save to Hamza's own server over this private link (no account needed) and feed the next
+  rebuild. General training and wellness reasoning, not medical advice.
+</footer>
+</div>
+
+<!--SCRIPT_START-->
+<script>
+(function(){
+  var $=function(s){return document.querySelector(s);};
+  var KEY=new URLSearchParams(location.search).get("key")||"";
+  var LOG={entries:{}};
+  var today=new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Amman"});
+  var esc=function(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");};
+  var state={soreWhere:[],scheduleChange:[],cookiesPrevTimes:[]};
+
+  var hd=$("#hd-date");
+  if(hd)hd.textContent=new Date().toLocaleDateString("en-GB",
+    {timeZone:"Asia/Amman",weekday:"long",day:"numeric",month:"long"});
+
+  function showTab(name){
+    document.querySelectorAll(".ci-tabs button").forEach(function(x){x.classList.toggle("on",x.dataset.tab===name);});
+    document.querySelectorAll(".ci-pane").forEach(function(p){p.hidden=p.dataset.pane!==name;});
+  }
+  document.querySelectorAll(".ci-tabs button").forEach(function(t){t.addEventListener("click",function(){showTab(t.dataset.tab);});});
+
+  function gymDayInfo(){
+    var e=LOG.entries[today]||{};
+    var dow=new Date().toLocaleDateString("en-US",{timeZone:"Asia/Amman",weekday:"short"});
+    var SPLIT={Tue:"Lower day",Thu:"Upper day",Fri:"Lower day",Sat:"Upper \\u00b7 arms day"};
+    var label=SPLIT[dow]||null;
+    var sc={};[].concat(e.scheduleChange||[]).concat(state.scheduleChange||[]).forEach(function(v){sc[v]=1;});
+    if(sc["extra-session"]||sc["swapped-days"]||sc["new-split"])label=label||"Training day";
+    if(sc["unplanned-rest"])label=null;
+    if(e.gym&&e.gym.savedAt)label=label||"Training day";
+    return label;
+  }
+  function updateCookieVisibility(){
+    document.querySelectorAll(".ck-am").forEach(function(q){
+      q.style.display=state.cookiesPrev==="yes"?"":"none";});
+    document.querySelectorAll(".ck-gym").forEach(function(q){
+      q.style.display=(state.cookiesPre==="yes"&&state.gymType!=="rest")?"":"none";});
+  }
+
+  function updateGymVisibility(){
+    var label=gymDayInfo();
+    var tab=document.querySelector('.ci-tabs button[data-tab="gym"]');
+    if(tab){tab.style.display=label?"":"none";
+      if(!label&&!document.querySelector('[data-pane="gym"]').hidden)showTab("am");}
+  }
+
+  function renderTodo(){
+    var old=document.getElementById("ci-todo");if(old)old.remove();
+    var e=LOG.entries[today]||{};
+    var trainDay=gymDayInfo();
+    var items=[];
+    if(!e.savedAt)items.push({label:"Morning log",tab:"am"});
+    if(trainDay&&!(e.gym&&e.gym.savedAt))items.push({label:"After training \\u00b7 "+trainDay,tab:"gym"});
+    if(!items.length)return;
+    var div=document.createElement("div");div.id="ci-todo";
+    div.innerHTML='<span class="t">Still to log today</span><span class="items"></span>'+
+      '<span class="done-note">tap one \\u2014 it disappears once saved</span>';
+    var wrap=div.querySelector(".items");
+    items.forEach(function(it){
+      var b=document.createElement("button");b.type="button";b.textContent=it.label;
+      b.addEventListener("click",function(){showTab(it.tab);
+        document.getElementById("checkin").scrollIntoView({behavior:"smooth",block:"start"});});
+      wrap.appendChild(b);
+    });
+    if(trainDay&&!(e.gym&&e.gym.savedAt)){
+      var rb=document.createElement("button");rb.type="button";rb.className="restbtn";
+      rb.textContent="Not training today";
+      rb.addEventListener("click",function(){
+        rb.disabled=true;rb.textContent="Saving\\u2026";
+        postPatch({scheduleChange:["unplanned-rest"]}).then(function(){
+          if(msg)msg.textContent="Rest day logged \\u2014 no training log needed today.";
+          refresh();
+        }).catch(function(){
+          rb.disabled=false;rb.textContent="Not training today";
+          if(msg)msg.textContent="Couldn't save \\u2014 check your internet and try again.";
+        });
+      });
+      wrap.appendChild(rb);
+    }
+    var mast=document.querySelector(".mast");
+    if(mast&&mast.parentNode)mast.parentNode.insertBefore(div,mast.nextSibling);
+    else document.body.prepend(div);
+  }
+
+  document.querySelectorAll(".chips").forEach(function(g){
+    var name=g.dataset.name,single=g.hasAttribute("data-single");
+    g.addEventListener("click",function(e){
+      var b=e.target.closest("button");if(!b)return;
+      if(single){g.querySelectorAll("button").forEach(function(x){x.classList.remove("on");});
+        b.classList.add("on");state[name]=b.dataset.v;
+        if(name==="gymType"){var rest=b.dataset.v==="rest";
+          document.querySelectorAll(".gym-only").forEach(function(q){q.style.display=rest?"none":"";});}
+        if(name==="cookiesPrev"||name==="cookiesPre"||name==="gymType")updateCookieVisibility();}
+      else{b.classList.toggle("on");
+        state[name]=[].map.call(g.querySelectorAll("button.on"),function(x){return x.dataset.v;});
+        if(name==="scheduleChange"){updateGymVisibility();renderTodo();}}
+    });
+  });
+
+  var GYMLBL={lower:"lower",upper:"upper","upper-arms":"arms",full:"full body",rpm:"RPM",other:"other",rest:"rest"};
+  function renderStatus(){
+    var st=$("#ci-status"),e=LOG.entries[today]||{};
+    var bits=[];
+    if(e.savedAt)bits.push("Morning logged \\u2713");
+    if(e.gym&&e.gym.savedAt)bits.push("Training logged \\u2713");
+    if(e.dayNote)bits.push("Day comment \\u2713");
+    var sc=[].concat(e.scheduleChange||[]);
+    if(sc.indexOf("unplanned-rest")>=0)bits.push("Rest day \\u2713");
+    else if(sc.length)bits.push("Plan change \\u2713");
+    st.innerHTML=bits.length?'<div class="ci-done">'+bits.join(" &nbsp;&middot;&nbsp; ")+
+      '<span>Saving again replaces that part.</span></div>':"";
+    var days=Object.keys(LOG.entries).sort().reverse();
+    var h=$("#ci-history");
+    if(days.length){
+      h.innerHTML='<div class="eyebrow">Logged: '+days.length+' day'+(days.length>1?'s':'')+'</div>'+
+        days.slice(0,7).map(function(d){var x=LOG.entries[d];var g=x.gym||{};
+          return '<div class="hrow"><span class="hd">'+d.slice(5)+'</span><span>'+
+          [x.soreness!==undefined?'sore '+x.soreness:null,
+           x.energy!==undefined?'energy '+x.energy:null,
+           x.feltStress!==undefined?'stress '+x.feltStress:null,
+           g.gymType?esc(GYMLBL[g.gymType]||g.gymType)+(g.gymFeel?' ('+esc(g.gymFeel)+')':''):null,
+           g.topSet?esc(g.topSet):null,
+           g.preSalt==="yes"?'salt':null,
+           x.weightKg?x.weightKg+'kg':null,
+           x.lateCaffeine&&x.lateCaffeine!=="none"?'caffeine '+esc(x.lateCaffeine):null,
+           x.scheduleChange?'plan: '+esc([].concat(x.scheduleChange).join(", ")):null,
+           x.note?esc(x.note):null,
+           g.gymNote?esc(g.gymNote):null,
+           x.dayNote?'"'+esc(x.dayNote)+'"':null].filter(Boolean).join(' \\u00b7 ')+
+          '</span></div>';}).join("");
+    } else h.innerHTML="";
+  }
+
+  var msg=$("#ci-msg");
+  var now=function(){return new Date().toLocaleTimeString("en-GB",{timeZone:"Asia/Amman",hour:"2-digit",minute:"2-digit"});};
+  function clean(o){Object.keys(o).forEach(function(k){if(o[k]===undefined)delete o[k];});return o;}
+
+  function buildAM(){
+    return clean({
+      soreness:state.soreness!==undefined?+state.soreness:undefined,
+      soreWhere:state.soreWhere.length?state.soreWhere:undefined,
+      energy:state.energy!==undefined?+state.energy:undefined,
+      feltStress:state.feltStress!==undefined?+state.feltStress:undefined,
+      school:state.school,stress:state.stress,lateCaffeine:state.lateCaffeine,
+      cookiesPrev:state.cookiesPrev,
+      cookiesPrevTimes:state.cookiesPrevTimes.length?state.cookiesPrevTimes:undefined,
+      cookiesPrevCount:state.cookiesPrevCount,
+      weightKg:(function(){var w=parseFloat(($("#ci-weight").value||"").replace(",","."));
+        return (w>=30&&w<=200)?w:undefined;})(),
+      note:$("#ci-note").value.trim()||undefined,
+      savedAt:now()});
+  }
+  function buildGym(){
+    return clean({gym:clean({
+      gymType:state.gymType,gymTime:state.gymTime,gymLength:state.gymLength,
+      gymFeel:state.gymFeel,gymPump:state.gymPump,preMeal:state.preMeal,
+      eatingDay:state.eatingDay,preworkout:state.preworkout,preSalt:state.preSalt,
+      cookiesPre:state.cookiesPre,cookiesPreGap:state.cookiesPreGap,
+      topSet:$("#ci-topset").value.trim()||undefined,
+      gymNote:$("#ci-gymnote").value.trim()||undefined,
+      savedAt:now()})});
+  }
+  function buildPlan(explicit){
+    return clean({
+      scheduleChange:(state.scheduleChange.length||explicit)?state.scheduleChange:undefined,
+      scheduleNote:$("#ci-plannote").value.trim()||undefined});
+  }
+  function buildNight(){
+    var v=$("#ci-daynote").value.trim();
+    return v?{dayNote:v,dayNoteAt:now()}:{};
+  }
+
+  function refresh(){renderStatus();renderTodo();updateGymVisibility();updateCookieVisibility();}
+
+  function postPatch(patch){
+    return fetch("/api/checkin?key="+encodeURIComponent(KEY),{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({date:today,patch:patch})
+    }).then(function(r){if(!r.ok)throw new Error("save "+r.status);return r.json();})
+      .then(function(j){if(j&&j.entry)LOG.entries[today]=j.entry;return j;});
+  }
+
+  function hydratePlan(){
+    var e=LOG.entries[today]||{};
+    var sc=[].concat(e.scheduleChange||[]);
+    if(sc.length){
+      state.scheduleChange=sc.slice();
+      var g=document.querySelector('.chips[data-name="scheduleChange"]');
+      if(g)sc.forEach(function(v){var b=g.querySelector('button[data-v="'+v+'"]');if(b)b.classList.add("on");});
+      var det=document.querySelectorAll(".ci-details")[0];if(det)det.open=true;
+    }
+    var pn=$("#ci-plannote");
+    if(e.scheduleNote&&pn&&!pn.value)pn.value=e.scheduleNote;
+  }
+
+  function load(){
+    fetch("/api/checkins?days=30&key="+encodeURIComponent(KEY),{cache:"no-store"})
+      .then(function(r){if(!r.ok)throw new Error("load "+r.status);return r.json();})
+      .then(function(j){LOG.entries=(j&&j.entries)||{};hydratePlan();refresh();})
+      .catch(function(){msg.textContent="Couldn't load earlier logs \\u2014 saving still works.";refresh();});
+  }
+  load();
+
+  document.querySelectorAll("[data-save]").forEach(function(btn){btn.addEventListener("click",function(){
+    var which=btn.dataset.save;
+    var part=which==="am"?buildAM():which==="gym"?buildGym():which==="plan"?{}:buildNight();
+    var plan=buildPlan(which==="plan");
+    var savedSC=[].concat((LOG.entries[today]||{}).scheduleChange||[]).length;
+    var meaningful=which==="am"?Object.keys(part).length>1
+      :which==="gym"?Object.keys(part.gym||{}).length>1
+      :which==="plan"?(state.scheduleChange.length>0||!!$("#ci-plannote").value.trim()||savedSC>0)
+      :Object.keys(part).length>0;
+    if(!meaningful&&!Object.keys(plan).length){msg.textContent="Tap at least one answer first.";return;}
+    var patch=Object.assign({},part,plan);
+    btn.disabled=true;msg.textContent="Saving\\u2026";
+    fetch("/api/checkin?key="+encodeURIComponent(KEY),{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({date:today,patch:patch})
+    }).then(function(r){
+      if(!r.ok)throw new Error("save "+r.status);
+      return r.json();
+    }).then(function(j){
+      if(j&&j.entry)LOG.entries[today]=j.entry;
+      btn.disabled=false;msg.textContent="Saved \\u2713 "+now();
+      refresh();
+    }).catch(function(err){
+      btn.disabled=false;
+      msg.textContent="Couldn't save ("+(err&&err.message?err.message:"error")+") \\u2014 check internet and try again.";
+    });
+  });});
+
+  // Keep the rings moving while the page is open: strain climbs all day, and
+  // recovery / sleep can land hours after the morning rebuild when he sleeps in.
+  function setText(sel,val){var e=document.querySelector(sel);if(e&&val!==undefined&&val!==null)e.textContent=val;}
+  function setArc(sel,dash,color){var e=document.querySelector(sel);if(!e)return;if(dash)e.style.strokeDasharray=dash;if(color)e.style.stroke=color;}
+  function paintLive(j){
+    if(!j)return;
+    setText('[data-live="s-val"]',j.text);
+    setArc('[data-live="s-arc"]',j.dash,null);
+    setText('[data-live="s-note"]',j.note);
+    setText('[data-live="s-kcal"]',j.kcal===null||j.kcal===undefined?"\u2014":String(j.kcal));
+    setText('[data-live="r-val"]',j.recoveryText);
+    setArc('[data-live="r-arc"]',j.recoveryDash,j.recoveryColor);
+    setText('[data-live="r-note"]',j.recoveryNote);
+    setText('[data-live="hrv"]',j.hrv);
+    setText('[data-live="rhr"]',j.rhr);
+    setText('[data-live="sl-val"]',j.sleepPct);
+    setArc('[data-live="sl-arc"]',j.sleepDash,j.sleepColor);
+    setText('[data-live="sl-note"]',j.sleepNote);
+    setText('[data-live="sl-dur"]',j.sleepDur);
+  }
+  function pullLive(){
+    if(!document.querySelector('[data-live]'))return;
+    fetch("/api/live?key="+encodeURIComponent(KEY),{cache:"no-store"})
+      .then(function(r){return r.ok?r.json():null;})
+      .then(paintLive)
+      .catch(function(){});
+  }
+  pullLive();
+  setInterval(pullLive,5*60*1000);
+  document.addEventListener("visibilitychange",function(){if(!document.hidden)pullLive();});
+})();
+</script>
+<!--SCRIPT_END-->
+</body>
+</html>
+`;
